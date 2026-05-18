@@ -96,6 +96,12 @@ type RuntimeConfig = {
   litellmPort: number
 }
 
+type NativeCommandResultMemory = {
+  command: string
+  summary_text: string
+  created_at: number
+}
+
 type SessionRuntime = {
   generation: number
   canResume: boolean
@@ -103,6 +109,7 @@ type SessionRuntime = {
   hydrated: boolean
   queue: InboundMessage[]
   running: boolean
+  lastNativeCommandResult: NativeCommandResultMemory | null
 }
 
 type TurnFailureDetails = {
@@ -495,27 +502,58 @@ function getRuntimeSessionId(sessionKey: string, generation: number): string {
   return deterministicSessionId(`${sessionKey}::${generation}`)
 }
 
+function normalizeNativeCommandResultMemory(input: unknown): NativeCommandResultMemory | null {
+  if (!input || typeof input !== 'object') return null
+  const record = input as Partial<NativeCommandResultMemory>
+  const command = String(record.command || '').trim()
+  const summaryText = String(record.summary_text || '').trim()
+  const createdAt = Number(record.created_at || 0)
+  if (!command || !summaryText || !Number.isFinite(createdAt) || createdAt <= 0) return null
+  return {
+    command,
+    summary_text: summaryText.slice(0, 2000),
+    created_at: createdAt,
+  }
+}
+
+function getFreshNativeCommandResultMemory(session: SessionRuntime): NativeCommandResultMemory | null {
+  const memory = normalizeNativeCommandResultMemory(session.lastNativeCommandResult)
+  if (!memory) return null
+  if (Date.now() - memory.created_at > 15 * 60 * 1000) return null
+  return memory
+}
+
 async function hydrateSessionRuntime(config: RuntimeConfig, sessionKey: string): Promise<SessionRuntime> {
   const session = getOrCreateSessionRuntime(sessionKey)
   if (session.hydrated) return session
   try {
     const raw = await readFile(getSessionStatePath(config, sessionKey), 'utf8')
-    const parsed = JSON.parse(raw) as { generation?: number; can_resume?: boolean; policy_version?: number; context_fingerprint?: string }
+    const parsed = JSON.parse(raw) as {
+      generation?: number
+      can_resume?: boolean
+      policy_version?: number
+      context_fingerprint?: string
+      last_native_command_result?: unknown
+    }
     const savedGeneration = Number.isInteger(parsed.generation) ? Number(parsed.generation) : 0
     const savedPolicyVersion = Number.isInteger(parsed.policy_version) ? Number(parsed.policy_version) : 0
+    const savedNativeCommandResult = normalizeNativeCommandResultMemory(parsed.last_native_command_result)
     if (savedPolicyVersion !== SESSION_POLICY_VERSION) {
       session.generation = savedGeneration + 1
       session.canResume = false
       session.contextFingerprint = ''
+      session.lastNativeCommandResult = null
     } else {
       session.generation = savedGeneration
       session.canResume = parsed.can_resume === true
       session.contextFingerprint = typeof parsed.context_fingerprint === 'string' ? parsed.context_fingerprint : ''
+      session.lastNativeCommandResult = savedNativeCommandResult
     }
   } catch {
     session.generation = 0
     session.canResume = false
     session.contextFingerprint = ''
+    session.lastNativeCommandResult = null
   }
   session.hydrated = true
   return session
@@ -534,6 +572,7 @@ async function persistSessionRuntime(
         generation: session.generation,
         can_resume: session.canResume,
         context_fingerprint: session.contextFingerprint || '',
+        last_native_command_result: normalizeNativeCommandResultMemory(session.lastNativeCommandResult),
         policy_version: SESSION_POLICY_VERSION,
         updated_at: nowIso(),
       },
@@ -617,7 +656,8 @@ async function writeRuntimeFiles(config: RuntimeConfig): Promise<{
     '本项目已经把角色缓存保存在 /home/yingying/yunzai/data/PlayerData 下。对于原神角色分析，优先读取这份结构化缓存，而不是把“只有面板图”当成唯一数据源。',
     '如果 yunzai_get_user_runtime_context 返回了 structured_caches，就应把这些缓存当作正式数据源使用。只有在相关缓存缺失、不存在或字段明显不足时，才继续尝试图片命令、联网补充或工程改造。',
     'follow-up 必须优先依赖上一轮真实结果中的 bundle、按钮、entity refs 和文本内容，不要靠硬编码关键词乱猜。',
-    '如果用户是在问“你是谁”“你可以做什么”“你能干什么”“你会什么”，优先直接用简短自然语言回答能力概览，不要优先调用 #帮助、#喵喵帮助 之类帮助图片命令，除非用户明确要求看帮助图或命令列表。',
+    '如果用户是在问“你可以做什么”“你能干什么”“你会什么”“功能列表”“指令菜单”，应优先执行 #帮助 或查询动态能力注册表；不要只按普通聊天泛泛回答。',
+    '如果用户问“你会原神/星铁/绝区零/塔罗吗”，应把它理解为机器人领域能力查询，优先执行 #帮助 或 yunzai_capability_search，不要回答成通用知识聊天。',
     '如果本地结果不足以回答最新攻略、活动、素材问题，再使用 WebSearch/WebFetch 联网补充，并在最终回答里给出来源。',
     '当用户明确要求你开发、修复、改造、增加工具、写适配器、读取结构化数据或直接让你改代码时，你可以直接在 /home/yingying/yunzai 和 /home/yingying/projects/cc-haha 内读取、编辑、创建文件，并可使用 Bash 运行必要的检索、构建和验证命令。',
     '如果用户没有明确要求改代码、修 bug、加能力或做工程改造，就不要主动修改仓库文件；普通聊天、普通命令执行、普通结果解释默认只读，不要擅自改代码。',
@@ -926,23 +966,7 @@ async function looksLikeRegisteredCapabilityTurn(config: RuntimeConfig, text: st
   if (!query || query.length > 80) return false
   if (/^(你好|您好|早|晚安|谢谢|谢了|在吗|你是谁|你会什么|你能干什么)$/i.test(query)) return false
   try {
-    const resp = await fetch(
-      `${config.yunzaiBaseUrl}${config.bridgeConfig.route_prefix}/capabilities/search?q=${encodeURIComponent(query)}&max_results=3`,
-      {
-        headers: {
-          Authorization: `Bearer ${config.bridgeConfig.gateway_token}`,
-        },
-      },
-    )
-    if (!resp.ok) return false
-    const parsed = await resp.json() as {
-      items?: Array<{ score?: number; invocation?: { rule_regexp?: string }; name?: string; description?: string }>
-    }
-    const top = Array.isArray(parsed.items) ? parsed.items[0] : null
-    const score = Number(top?.score || 0)
-    if (score >= 45) return true
-    const haystack = `${top?.name || ''} ${top?.description || ''} ${top?.invocation?.rule_regexp || ''}`
-    return score >= 25 && haystack.includes(query)
+    return !!await searchRegisteredCapabilityCommand(config, query)
   } catch {
     return false
   }
@@ -1121,6 +1145,172 @@ async function sendFallbackReply(
       bundle_ids: bundleIds,
     }),
   })
+}
+
+function isCapabilityOverviewTurn(text: string): boolean {
+  const normalized = text.trim()
+  return /(你可以干什么|你能干什么|你会什么|你有什么功能|你有哪些功能|功能列表|菜单|帮助|指令|命令|help)/i.test(normalized)
+    || /你会.*(原神|星铁|崩铁|星穹铁道|绝区零|zzz|塔罗|抽卡|面板)/i.test(normalized)
+}
+
+async function searchRegisteredCapabilityCommand(
+  config: RuntimeConfig,
+  text: string,
+): Promise<{ command: string; score: number; name: string } | null> {
+  const query = text.trim()
+  if (!query || query.length > 80) return null
+  const resp = await fetch(
+    `${config.yunzaiBaseUrl}${config.bridgeConfig.route_prefix}/capabilities/search?q=${encodeURIComponent(query)}&max_results=5`,
+    {
+      headers: {
+        Authorization: `Bearer ${config.bridgeConfig.gateway_token}`,
+      },
+    },
+  )
+  if (!resp.ok) return null
+  const parsed = await resp.json() as {
+    items?: Array<{
+      score?: number
+      name?: string
+      risk?: { level?: string }
+      invocation?: { command_examples?: string[] }
+    }>
+  }
+  for (const item of Array.isArray(parsed.items) ? parsed.items : []) {
+    const score = Number(item?.score || 0)
+    const riskLevel = String(item?.risk?.level || '').trim()
+    const examples = Array.isArray(item?.invocation?.command_examples) ? item.invocation.command_examples : []
+    const command = examples.map(entry => String(entry || '').trim()).find(Boolean)
+    const commandKeyword = String(command || '').replace(/^#+/, '').trim().toLowerCase()
+    const compactQuery = query.replace(/\s+/g, '').toLowerCase()
+    if (score >= 45 && command && commandKeyword && compactQuery.includes(commandKeyword) && riskLevel !== 'high') {
+      return {
+        command,
+        score,
+        name: String(item?.name || '').trim(),
+      }
+    }
+  }
+  return null
+}
+
+function wantsNativeCommandResultExplanation(text: string): boolean {
+  return /(解读|解释|分析|说明|什么意思|代表什么|含义|怎么看)/.test(text.trim())
+}
+
+function isNativeCommandExplanationFollowup(text: string): boolean {
+  const normalized = text.trim()
+  if (!normalized) return false
+  if (/(抽|重新|再来|再抽|来一张|换一张)/.test(normalized)) return false
+  return /(没有解读|没解读|还没解读|你没有解释|你没解释|解读一下|解释一下|分析一下|什么意思|代表什么|含义|怎么看)/.test(normalized)
+}
+
+async function explainNativeCommandResult(
+  config: RuntimeConfig,
+  payload: InboundMessage,
+  command: string,
+  summaryText: string,
+): Promise<string> {
+  const promptConfig = resolvePromptConfig(config)
+  const system = [
+    `你是${promptConfig.identity}`,
+    '你只能基于真实 Yunzai 命令结果进行解释。',
+    '不要声称重新执行了命令，不要编造命令结果里没有的牌、角色、数值或图片内容。',
+    '用简短自然的中文回答，最多 4 句。',
+  ].join('\n')
+  const user = [
+    `用户原话：${payload.text.trim()}`,
+    `真实命令：${command}`,
+    '真实结果摘要：',
+    summaryText.trim(),
+    '',
+    '请基于这个真实结果解释给用户。',
+  ].join('\n')
+  const resp = await fetch(`http://127.0.0.1:${config.litellmPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: config.provider.model,
+      temperature: 0.2,
+      max_tokens: 256,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+    }),
+  })
+  if (!resp.ok) {
+    throw new Error(`native command explanation failed: ${resp.status} ${resp.statusText}`)
+  }
+  const parsed = await resp.json() as {
+    choices?: Array<{ message?: { content?: string } }>
+  }
+  return String(parsed.choices?.[0]?.message?.content || '').trim()
+}
+
+async function runNativeYunzaiCommandFastPath(
+  config: RuntimeConfig,
+  payload: InboundMessage,
+  command: string,
+  options: { explainResult?: boolean } = {},
+): Promise<{
+  ok: boolean
+  command?: string
+  bundle_ids?: string[]
+  summary?: { text?: string }
+  reply_text?: string
+  error?: string
+}> {
+  const resp = await fetch(`${config.yunzaiBaseUrl}${config.bridgeConfig.route_prefix}/internal/run-command-capture`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${config.bridgeConfig.gateway_token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      session_key: payload.session_key,
+      turn_id: payload.message_id,
+      command,
+    }),
+  })
+  const result = await resp.json() as {
+    ok?: boolean
+    command?: string
+    bundle_ids?: string[]
+    summary?: { text?: string }
+    error?: string
+  }
+  if (!resp.ok || result.ok !== true) {
+    throw new Error(result?.error || `command capture failed: ${resp.status}`)
+  }
+
+  const bundleIds = Array.isArray(result.bundle_ids) ? result.bundle_ids : []
+  const summaryText = String(result.summary?.text || '').trim()
+  let replyText = bundleIds.length ? '' : summaryText
+  if (options.explainResult && summaryText) {
+    try {
+      replyText = await explainNativeCommandResult(config, payload, result.command || command, summaryText)
+    } catch (err) {
+      logTurn(payload, `命令结果解释失败，回退摘要: ${err instanceof Error ? err.message : String(err)}`)
+      replyText = summaryText
+    }
+  }
+
+  if (bundleIds.length && replyText) {
+    await sendFallbackReply(config, payload, '', bundleIds)
+    await sendFallbackReply(config, payload, replyText)
+  } else {
+    await sendFallbackReply(config, payload, replyText, bundleIds)
+  }
+  return {
+    ok: true,
+    command: result.command || command,
+    bundle_ids: bundleIds,
+    summary: result.summary,
+    reply_text: replyText,
+  }
 }
 
 async function runDirectChatTurn(
@@ -1439,6 +1629,92 @@ async function processTurn(payload: InboundMessage): Promise<void> {
   }
   logTurn(payload, `收到新回合 generation=${session.generation} canResume=${session.canResume ? 'true' : 'false'}`)
 
+  const nativeCommandMemory = getFreshNativeCommandResultMemory(session)
+  if (nativeCommandMemory && isNativeCommandExplanationFollowup(payload.text)) {
+    let explanation = nativeCommandMemory.summary_text
+    try {
+      explanation = await explainNativeCommandResult(
+        config,
+        payload,
+        nativeCommandMemory.command,
+        nativeCommandMemory.summary_text,
+      )
+    } catch (err) {
+      logTurn(payload, `上一条命令结果解释失败，回退摘要: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    await sendFallbackReply(config, payload, explanation)
+    session.canResume = false
+    session.contextFingerprint = contextFingerprint
+    await persistSessionRuntime(config, payload.session_key, session)
+    await writeTurnTrace(config, payload.message_id, {
+      ok: true,
+      payload,
+      delivered: true,
+      result_text: explanation,
+      raw_output: JSON.stringify(nativeCommandMemory),
+      session_generation: session.generation,
+      fast_path: `native_command_explanation:${nativeCommandMemory.command}`,
+    })
+    logTurn(payload, `已解释上一条命令结果 command=${nativeCommandMemory.command}`)
+    return
+  }
+
+  if (isCapabilityOverviewTurn(payload.text)) {
+    const result = await runNativeYunzaiCommandFastPath(config, payload, '#帮助')
+    const summaryText = String(result.summary?.text || '').trim()
+    if (summaryText) {
+      session.lastNativeCommandResult = {
+        command: result.command || '#帮助',
+        summary_text: summaryText,
+        created_at: Date.now(),
+      }
+    }
+    session.canResume = false
+    session.contextFingerprint = contextFingerprint
+    await persistSessionRuntime(config, payload.session_key, session)
+    await writeTurnTrace(config, payload.message_id, {
+      ok: true,
+      payload,
+      delivered: true,
+      result_text: result.reply_text || result.summary?.text || '',
+      raw_output: JSON.stringify(result),
+      session_generation: session.generation,
+      fast_path: 'native_command:#帮助',
+    })
+    logTurn(payload, `能力概览已直接执行 #帮助 bundle_count=${result.bundle_ids?.length || 0}`)
+    return
+  }
+
+  const registeredCommand = await searchRegisteredCapabilityCommand(config, payload.text)
+  if (registeredCommand) {
+    const result = await runNativeYunzaiCommandFastPath(config, payload, registeredCommand.command, {
+      explainResult: wantsNativeCommandResultExplanation(payload.text),
+    })
+    const summaryText = String(result.summary?.text || '').trim()
+    if (summaryText) {
+      session.lastNativeCommandResult = {
+        command: result.command || registeredCommand.command,
+        summary_text: summaryText,
+        created_at: Date.now(),
+      }
+    }
+    session.canResume = false
+    session.contextFingerprint = contextFingerprint
+    await persistSessionRuntime(config, payload.session_key, session)
+    await writeTurnTrace(config, payload.message_id, {
+      ok: true,
+      payload,
+      delivered: true,
+      result_text: result.reply_text || result.summary?.text || '',
+      raw_output: JSON.stringify(result),
+      session_generation: session.generation,
+      fast_path: `native_command:${registeredCommand.command}`,
+      capability_match: registeredCommand,
+    })
+    logTurn(payload, `动态能力已直接执行 ${registeredCommand.command} match=${registeredCommand.name || 'unknown'} score=${registeredCommand.score}`)
+    return
+  }
+
   if (!isStructuredAnalysisTurn(payload.text) && !looksLikeActionTurn(payload.text) && !registeredCapabilityTurn) {
     try {
       const directText = await runDirectChatTurn(config, payload)
@@ -1604,6 +1880,7 @@ function getOrCreateSessionRuntime(sessionKey: string): SessionRuntime {
       hydrated: false,
       queue: [],
       running: false,
+      lastNativeCommandResult: null,
     }
     state.sessions.set(sessionKey, session)
   }
