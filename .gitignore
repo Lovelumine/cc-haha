@@ -9,6 +9,9 @@ openspec
 .runtime/
 extracted-natives/
 
+# Local QQ/Yunzai gateway runtime (generated config may contain credentials)
+runtime/qq-gateway/
+
 # Adapter attachment cache (created at runtime by AttachmentStore when
 # running adapter tests or the feishu/telegram adapters locally)
 .lark-attachments/
