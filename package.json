@@ -30,6 +30,7 @@
     "quality:baseline": "bun run quality:gate --mode baseline",
     "quality:release": "bun run quality:gate --mode release",
     "quality:smoke": "bun run quality:gate --mode baseline --allow-live --only 'provider-smoke:*' --only 'desktop-smoke:*'",
+    "qq-gateway": "bun run ./src/entrypoints/qq-gateway.ts",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs"
